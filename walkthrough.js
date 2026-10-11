@@ -5,12 +5,15 @@ const chalk = require('chalk');
 const fs = require('fs').promises;
 const path = require('path');
 const { exec } = require('child_process');
+const crypto = require('crypto');
 const { CredentialManager } = require('./utils/credential-manager');
 const {
   AITextService,
   PROVIDERS,
   GEMINI_MODELS,
-  GEMINI_DEFAULT_MODEL
+  GEMINI_DEFAULT_MODEL,
+  listOllamaModels,
+  defaultOllamaBaseURL
 } = require('./utils/ai-text-service');
 const { Database } = require('./database/db');
 const { checkFFmpeg, ffmpegInstallHint } = require('./utils/ffmpeg');
@@ -106,6 +109,27 @@ const AI_PROVIDER_GUIDE = {
       credentials.aiProvider = { provider: 'glm', apiKey, model };
     },
     validationCreds: (apiKey, model) => ({ aiProvider: { provider: 'glm', apiKey, model } })
+  },
+  ollama: {
+    label: 'Ollama (local) — runs on this machine, no API key, no per-token cost',
+    local: true,
+    covers: 'scripts only (add a Gemini or OpenAI key for images/voice)',
+    save(credentials, _apiKey, model, extra = {}) {
+      credentials.aiProvider = {
+        provider: 'ollama',
+        baseURL: extra.baseURL,
+        model,
+        disableReasoning: extra.disableReasoning === true
+      };
+    },
+    validationCreds: (_apiKey, model, extra = {}) => ({
+      aiProvider: {
+        provider: 'ollama',
+        baseURL: extra.baseURL,
+        model,
+        disableReasoning: extra.disableReasoning === true
+      }
+    })
   }
 };
 
@@ -226,11 +250,11 @@ class SetupWalkthrough {
     console.log(chalk.green('  ✓ Database'));
 
     // Create .env from a minimal template if the user doesn't have one yet
+    const envPath = path.join(__dirname, '.env');
     try {
-      await fs.access(path.join(__dirname, '.env'));
+      await fs.access(envPath);
       console.log(chalk.green('  ✓ .env file'));
     } catch (error) {
-      const envPath = path.join(__dirname, '.env');
       await fs.writeFile(envPath, [
         '# Created by the guided walkthrough — see .env.example for every option',
         'NODE_ENV=production',
@@ -242,6 +266,34 @@ class SetupWalkthrough {
       await fs.chmod(envPath, 0o600);
       console.log(chalk.green('  ✓ .env file created'));
     }
+
+    await this.ensureDashboardKey(envPath);
+  }
+
+  // The dashboard refuses to change provider credentials without this key, so a
+  // strong one is generated rather than left to the operator to invent.
+  async ensureDashboardKey(envPath) {
+    let contents = '';
+    try {
+      contents = await fs.readFile(envPath, 'utf8');
+    } catch (error) {
+      return;
+    }
+
+    if (/^\s*API_KEY\s*=\s*\S/m.test(contents)) {
+      console.log(chalk.green('  ✓ Dashboard API key'));
+      return;
+    }
+
+    const generated = crypto.randomBytes(32).toString('base64url');
+    const withoutEmpty = contents.replace(/^\s*API_KEY\s*=\s*$/m, '').trimEnd();
+    const next = `${withoutEmpty}\n\n# Required to change provider credentials from the dashboard.\nAPI_KEY=${generated}\n`;
+
+    await fs.writeFile(envPath, next, { mode: 0o600 });
+    await fs.chmod(envPath, 0o600);
+    process.env.API_KEY = generated;
+    console.log(chalk.green('  ✓ Dashboard API key generated'));
+    console.log(chalk.gray('    The dashboard asks for it once per browser; read it from .env when prompted.'));
   }
 
   // ── Step 2: AI provider ────────────────────────────────────────────────
@@ -270,6 +322,8 @@ class SetupWalkthrough {
     }]);
 
     const guide = AI_PROVIDER_GUIDE[providerId];
+
+    if (guide.local) return this.configureLocalProvider(providerId, guide);
 
     console.log(chalk.cyan(`\nHow to get your key (${guide.keyHint}):`));
     guide.instructions.forEach((line, i) => console.log(chalk.white(`  ${i + 1}. ${line}`)));
@@ -321,7 +375,76 @@ class SetupWalkthrough {
     }
   }
 
-  async validateAIKey(guide, apiKey, model) {
+  // A local server needs an address and a model instead of a key, so it gets its
+  // own branch rather than bending the paste-your-key flow.
+  async configureLocalProvider(providerId, guide) {
+    console.log(chalk.cyan('\nThis provider runs on your own machine — no API key, no per-token charge.'));
+    console.log(chalk.gray(`  This covers: ${guide.covers}`));
+
+    const { baseURL } = await inquirer.prompt([{
+      type: 'input',
+      name: 'baseURL',
+      message: 'Server address (empty to skip this step):',
+      default: defaultOllamaBaseURL().replace(/\/v1$/, '')
+    }]);
+
+    if (!baseURL.trim()) {
+      console.log(chalk.yellow('  Skipped — configure later with: npm run walkthrough'));
+      return;
+    }
+
+    const normalized = baseURL.trim().replace(/\/+$/, '');
+    const endpoint = normalized.endsWith('/v1') ? normalized : `${normalized}/v1`;
+
+    console.log(chalk.gray('  Asking the server which models are installed...'));
+    let models = [];
+    try {
+      models = await listOllamaModels(endpoint);
+    } catch (error) {
+      console.log(chalk.red(`  Could not reach ${endpoint}: ${error.message}`));
+      console.log(chalk.yellow('  Start the server first (ollama serve), then re-run: npm run walkthrough'));
+      return;
+    }
+
+    if (!models.length) {
+      console.log(chalk.yellow('  No local models are installed. Pull one, for example:'));
+      console.log(chalk.white('    ollama pull gemma3:12b'));
+      return;
+    }
+
+    const { model } = await inquirer.prompt([{
+      type: 'list',
+      name: 'model',
+      message: 'Model to use:',
+      choices: models.map(entry => ({
+        name: entry.parameterSize ? `${entry.name} · ${entry.parameterSize} ${entry.quantization || ''}`.trim() : entry.name,
+        value: entry.name
+      }))
+    }]);
+
+    const { disableReasoning } = await inquirer.prompt([{
+      type: 'confirm',
+      name: 'disableReasoning',
+      message: 'Disable model reasoning? (needed for reasoning models, which otherwise return nothing)',
+      default: true
+    }]);
+
+    console.log(chalk.gray('  Testing the model with a tiny request...'));
+    const extra = { baseURL: endpoint, disableReasoning };
+    const ok = await this.validateAIKey(guide, '', model, extra);
+
+    if (!ok) {
+      console.log(chalk.red('  The server did not return usable text.'));
+      console.log(chalk.yellow('  Try another model, or turn the reasoning switch the other way.'));
+      return;
+    }
+
+    guide.save(this.cm.credentials, '', model, extra);
+    await this.cm.saveCredentials();
+    console.log(chalk.green(`  ✓ ${model} works! Saved.`));
+  }
+
+  async validateAIKey(guide, apiKey, model, extra = {}) {
     // Temporarily clear provider env keys so the test hits exactly the pasted key
     const envKeys = [...Object.values(PROVIDERS).map(p => p.envKey), 'GEMINI_API_KEY'];
     const savedEnv = {};
@@ -331,7 +454,7 @@ class SetupWalkthrough {
     }
 
     try {
-      const service = new AITextService(guide.validationCreds(apiKey, model));
+      const service = new AITextService(guide.validationCreds(apiKey, model, extra));
       const reply = await service.generateText('Reply with the single word OK.', { maxTokens: 20, temperature: 0 });
       return typeof reply === 'string' && reply.length > 0;
     } catch (error) {

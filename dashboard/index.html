@@ -282,6 +282,28 @@
           </div>
           <div class="form-actions"><button type="submit" class="button primary">Save channel setup</button><button id="api-key-button" type="button" class="button secondary">Set dashboard API key</button></div>
         </form>
+
+        <div class="section-intro"><div><h2>AI text provider</h2><p>Writes scripts, strategy plans, and SEO metadata. A local provider keeps prompts on this machine and costs nothing to run.</p></div></div>
+        <form id="text-provider-form" class="panel settings-form">
+          <div id="text-provider-locked" class="setup-banner hidden">
+            <div><strong>Set a dashboard API key first</strong><p>Changing provider credentials from the browser requires API_KEY in your .env, so another account on this machine cannot overwrite them.</p></div>
+            <code>API_KEY=…</code>
+          </div>
+          <div class="form-grid">
+            <label><span>Provider</span><select name="provider" id="text-provider-select"></select><small id="text-provider-status">Loading…</small></label>
+            <label id="text-provider-model-row"><span>Model</span><select name="model" id="text-provider-model"></select><small id="text-provider-model-hint"></small></label>
+            <label class="full-row" id="text-provider-key-row"><span>API key</span><input name="apiKey" type="password" autocomplete="off" placeholder="Leave empty to keep the stored key"><small id="text-provider-key-hint">Stored locally in config/credentials.json and never returned to this page.</small></label>
+            <label class="full-row hidden" id="text-provider-url-row"><span>Server address</span><input name="baseURL" autocomplete="off" placeholder="http://localhost:11434"><small>Where the local server listens. Prompts are sent here.</small></label>
+          </div>
+          <div class="settings-row hidden" id="text-provider-reasoning-row">
+            <label class="toggle"><input id="text-provider-reasoning" type="checkbox"><span></span> Disable model reasoning</label>
+            <small>Reasoning models spend the token budget thinking and can return nothing. Turn this on for them.</small>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="button primary">Save provider</button>
+            <button id="text-provider-refresh" type="button" class="button secondary hidden">Reload local models</button>
+          </div>
+        </form>
       </section>
     </main>
   </div>

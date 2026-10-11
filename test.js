@@ -64,6 +64,7 @@ class SystemTest {
       { name: 'Reply Drafting', test: () => this.testReplyDrafting() },
       { name: 'Reply Approval and Posting', test: () => this.testReplyApprovalAndPosting() },
       { name: 'Engagement AI Provider Wiring', test: () => this.testEngagementAIProviderWiring() },
+      { name: 'Local Text Provider', test: () => this.testLocalTextProvider() },
       { name: 'Engagement Sync Schedule', test: () => this.testEngagementSyncSchedule() },
       { name: 'Growth Experiment Refresh Schedule', test: () => this.testGrowthExperimentRefreshSchedule() }
     ];
@@ -2836,20 +2837,31 @@ class SystemTest {
       throw new Error('SetupWalkthrough.run is not implemented');
     }
 
-    // Every guided provider must be complete and coherent
+    // Every guided provider must be complete and coherent. A local provider is
+    // selected by address and model, so it has no key URL or model catalogue.
     for (const [id, guide] of Object.entries(AI_PROVIDER_GUIDE)) {
-      for (const field of ['label', 'keyUrl', 'instructions', 'models', 'defaultModel', 'save', 'validationCreds']) {
+      const required = guide.local
+        ? ['label', 'covers', 'save', 'validationCreds']
+        : ['label', 'keyUrl', 'instructions', 'models', 'defaultModel', 'save', 'validationCreds'];
+      for (const field of required) {
         if (!guide[field]) {
           throw new Error(`Provider guide "${id}" is missing "${field}"`);
         }
       }
-      if (!guide.models.includes(guide.defaultModel)) {
+      if (!guide.local && !guide.models.includes(guide.defaultModel)) {
         throw new Error(`Provider guide "${id}" default model is not in its model list`);
       }
 
       // save() must produce credentials that pass validation
       const credentials = {};
-      guide.save(credentials, 'test-key', guide.defaultModel);
+      if (guide.local) {
+        guide.save(credentials, '', 'test-model', { baseURL: 'http://localhost:11434/v1' });
+        if (credentials.aiProvider?.apiKey) {
+          throw new Error(`Local provider guide "${id}" must not store an API key`);
+        }
+      } else {
+        guide.save(credentials, 'test-key', guide.defaultModel);
+      }
       const manager = new CredentialManager();
       manager.credentials = { youtube: { client_id: 'x' }, ...credentials };
 
@@ -2882,6 +2894,9 @@ class SystemTest {
     }
 
     for (const id of Object.keys(PROVIDERS)) {
+      // Local providers list what is installed at runtime, so there is no static
+      // catalogue to compare against.
+      if (PROVIDERS[id].local) continue;
       if (JSON.stringify(AI_PROVIDER_GUIDE[id].models) !== JSON.stringify(PROVIDERS[id].models)) {
         throw new Error(`Walkthrough provider "${id}" models drifted from the runtime catalog`);
       }
@@ -3487,6 +3502,126 @@ class SystemTest {
       if (savedEnv === undefined) delete process.env.OPENAI_API_KEY;
       else process.env.OPENAI_API_KEY = savedEnv;
     }
+  }
+
+  async testLocalTextProvider() {
+    const { AITextService } = require('./utils/ai-text-service');
+
+    const envKeys = ['OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'MOONSHOT_API_KEY', 'MIMO_API_KEY',
+      'GLM_API_KEY', 'GEMINI_API_KEY', 'OLLAMA_BASE_URL', 'OLLAMA_HOST'];
+    const savedEnv = {};
+    for (const key of envKeys) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+
+    try {
+      // A local provider is configured without any API key.
+      const local = new AITextService({
+        aiProvider: { provider: 'ollama', baseURL: 'http://localhost:11434/v1', model: 'test-model' }
+      });
+      if (!local.isAvailable()) {
+        throw new Error('A local provider with a model must count as configured');
+      }
+      if (local.model !== 'test-model' || local.baseURL !== 'http://localhost:11434/v1') {
+        throw new Error('Local provider did not keep its configured model and address');
+      }
+      if (local.reasoningEffort !== null) {
+        throw new Error('Reasoning must stay enabled unless the operator disables it');
+      }
+
+      // disableReasoning becomes the one switch the OpenAI-compatible path honours.
+      const quiet = new AITextService({
+        aiProvider: { provider: 'ollama', model: 'test-model', disableReasoning: true }
+      });
+      if (quiet.reasoningEffort !== 'none') {
+        throw new Error('disableReasoning must send reasoning_effort=none');
+      }
+
+      let sentRequest = null;
+      quiet.client = {
+        chat: { completions: { create: async request => {
+          sentRequest = request;
+          return { choices: [{ message: { content: 'ok' } }] };
+        } } }
+      };
+      await quiet.generateText('probe');
+      if (sentRequest?.reasoning_effort !== 'none') {
+        throw new Error('reasoning_effort was not forwarded to the provider');
+      }
+
+      // A reasoning model that returns only reasoning must say so, not blame the key.
+      const starved = new AITextService({ aiProvider: { provider: 'ollama', model: 'test-model' } });
+      starved.client = {
+        chat: { completions: { create: async () => ({
+          choices: [{ message: { content: '', reasoning: 'thought for a long time' } }]
+        }) } }
+      };
+      let message = '';
+      try {
+        await starved.generateText('probe');
+      } catch (error) {
+        message = error.message;
+      }
+      if (!/reasoning/i.test(message)) {
+        throw new Error(`Empty-content error must name the reasoning cause, got: ${message}`);
+      }
+
+      // The manager must treat a local model as a configured provider.
+      const manager = new CredentialManager();
+      manager.credentials = {
+        youtube: { client_id: 'x' },
+        aiProvider: { provider: 'ollama', baseURL: 'http://localhost:11434/v1', model: 'test-model' }
+      };
+      if (!manager.hasAITextProvider()) {
+        throw new Error('hasAITextProvider must accept a local provider that has a model');
+      }
+
+      // Nothing the dashboard receives may contain a usable secret.
+      manager.credentials.aiProvider = { provider: 'openai', apiKey: 'sk-supersecret-value', model: 'gpt-5.6' };
+      const described = JSON.stringify(manager.describeTextProvider());
+      if (described.includes('sk-supersecret-value')) {
+        throw new Error('describeTextProvider leaked the stored API key');
+      }
+      if (!described.includes('••••alue')) {
+        throw new Error('describeTextProvider must report a masked hint for a stored key');
+      }
+
+      // A provider change has to reach the long-lived agents, which each build
+      // their AITextService once at construction.
+      const { YouTubeAutomationAgent } = require('./index');
+      const host = new YouTubeAutomationAgent();
+      const original = new AITextService({});
+      host.credentials = {
+        credentials: { aiProvider: { provider: 'ollama', baseURL: 'http://localhost:11434/v1', model: 'test-model' } }
+      };
+      host.agents = {
+        strategy: { aiTextService: original },
+        scriptWriter: { aiTextService: original },
+        seoOptimizer: { aiTextService: original }
+      };
+      host.engagement = { aiTextService: original };
+
+      const reloaded = host.refreshTextProviders();
+      if (reloaded !== 4) {
+        throw new Error(`refreshTextProviders must reload all four consumers, reloaded ${reloaded}`);
+      }
+      for (const [name, holder] of Object.entries({ ...host.agents, engagement: host.engagement })) {
+        if (holder.aiTextService === original) {
+          throw new Error(`refreshTextProviders left "${name}" on the old provider`);
+        }
+        if (holder.aiTextService.model !== 'test-model') {
+          throw new Error(`refreshTextProviders gave "${name}" the wrong model`);
+        }
+      }
+    } finally {
+      for (const key of envKeys) {
+        if (savedEnv[key] === undefined) delete process.env[key];
+        else process.env[key] = savedEnv[key];
+      }
+    }
+
+    this.logger.info('Local text provider test completed successfully');
   }
 
   async testEngagementSyncSchedule() {

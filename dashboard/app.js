@@ -797,6 +797,9 @@ function switchView(view) {
   $('#view-eyebrow').textContent = titles[view][0];
   $('#view-title').textContent = titles[view][1];
   location.hash = view;
+  // Provider state is fetched on demand rather than in the 8s dashboard poll,
+  // which would otherwise reset the form while it is being edited.
+  if (view === 'settings') loadTextProvider();
 }
 
 function selectOptions(options, selected) {
@@ -1743,6 +1746,149 @@ $('#profile-form').addEventListener('submit', async event => {
 
 $('#api-key-button').addEventListener('click', () => {
   if (requestApiKey() !== null) showToast('Dashboard API key saved in this browser.');
+});
+
+// ── AI text provider panel ───────────────────────────────────────────────────
+const textProvider = { state: null, ollamaModels: [], loading: false };
+
+function selectedProviderEntry() {
+  const id = $('#text-provider-select').value;
+  return textProvider.state?.providers.find(entry => entry.id === id) || null;
+}
+
+// Options are built as DOM nodes rather than markup so a model name can never
+// be interpreted as HTML.
+function fillSelect(select, items, selected) {
+  select.replaceChildren();
+  for (const item of items) {
+    const option = document.createElement('option');
+    option.value = item.value;
+    option.textContent = item.label;
+    if (item.value === selected) option.selected = true;
+    select.append(option);
+  }
+}
+
+async function loadOllamaModels(baseURL) {
+  const query = baseURL ? `?baseURL=${encodeURIComponent(baseURL)}` : '';
+  try {
+    const response = await api(`/api/providers/ollama/models${query}`);
+    textProvider.ollamaModels = response.result || [];
+    $('#text-provider-model-hint').textContent = textProvider.ollamaModels.length
+      ? `${textProvider.ollamaModels.length} model(s) installed locally.`
+      : 'No local models found. Pull one with: ollama pull <model>';
+  } catch (error) {
+    textProvider.ollamaModels = [];
+    $('#text-provider-model-hint').textContent = error.message;
+  }
+  renderProviderFields();
+}
+
+function renderProviderFields() {
+  const entry = selectedProviderEntry();
+  if (!entry) return;
+  const state = textProvider.state;
+
+  $('#text-provider-key-row').classList.toggle('hidden', entry.local);
+  $('#text-provider-url-row').classList.toggle('hidden', !entry.local);
+  $('#text-provider-reasoning-row').classList.toggle('hidden', false);
+  $('#text-provider-refresh').classList.toggle('hidden', !entry.local);
+
+  const isActive = entry.id === state.active;
+  const modelSelect = $('#text-provider-model');
+
+  if (entry.local) {
+    const items = textProvider.ollamaModels.map(model => ({
+      value: model.name,
+      label: model.parameterSize
+        ? `${model.name} · ${model.parameterSize} ${model.quantization || ''}`.trim()
+        : model.name
+    }));
+    fillSelect(modelSelect, items.length ? items : [{ value: '', label: 'No local models found' }],
+      isActive ? state.model : items[0]?.value);
+    modelSelect.disabled = items.length === 0;
+  } else {
+    fillSelect(modelSelect, entry.models.map(model => ({ value: model, label: model })),
+      isActive ? state.model : entry.defaultModel);
+    modelSelect.disabled = false;
+    $('#text-provider-model-hint').textContent = '';
+  }
+
+  const keyHint = $('#text-provider-key-hint');
+  keyHint.textContent = entry.keyConfigured
+    ? `A key ending ${entry.keyHint} is stored. Leave empty to keep it.`
+    : 'Stored locally in config/credentials.json and never returned to this page.';
+
+  $('#text-provider-status').textContent = isActive
+    ? `Active${state.baseURL ? ` · ${state.baseURL}` : ''}`
+    : 'Not active — save to switch to this provider.';
+}
+
+async function loadTextProvider() {
+  if (textProvider.loading) return;
+  textProvider.loading = true;
+  try {
+    const response = await api('/api/providers/text');
+    textProvider.state = response.result;
+
+    const select = $('#text-provider-select');
+    fillSelect(select, textProvider.state.providers.map(entry => ({
+      value: entry.id,
+      label: entry.local ? `${entry.name} · no API key needed` : entry.name
+    })), textProvider.state.active || 'openai');
+
+    $('#text-provider-reasoning').checked = Boolean(textProvider.state.disableReasoning);
+    const urlInput = $('#text-provider-form').elements.baseURL;
+    if (urlInput && document.activeElement !== urlInput) {
+      urlInput.value = textProvider.state.baseURL || '';
+    }
+
+    if (selectedProviderEntry()?.local) await loadOllamaModels(textProvider.state.baseURL);
+    else renderProviderFields();
+  } catch (error) {
+    $('#text-provider-status').textContent = error.message;
+  } finally {
+    textProvider.loading = false;
+  }
+}
+
+$('#text-provider-select').addEventListener('change', async () => {
+  if (selectedProviderEntry()?.local) await loadOllamaModels($('#text-provider-form').elements.baseURL.value);
+  else renderProviderFields();
+});
+
+$('#text-provider-refresh').addEventListener('click', () => {
+  loadOllamaModels($('#text-provider-form').elements.baseURL.value);
+});
+
+$('#text-provider-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const values = Object.fromEntries(new FormData(event.currentTarget));
+  const payload = {
+    provider: values.provider,
+    model: values.model,
+    disableReasoning: $('#text-provider-reasoning').checked
+  };
+  if (selectedProviderEntry()?.local) payload.baseURL = values.baseURL;
+  else if (values.apiKey) payload.apiKey = values.apiKey;
+
+  $('#loading').classList.add('active');
+  try {
+    const response = await api('/api/providers/text', { method: 'PUT', body: JSON.stringify(payload) });
+    textProvider.state = response.result;
+    // Never leave a typed secret sitting in the DOM after it is stored.
+    event.currentTarget.elements.apiKey.value = '';
+    $('#text-provider-locked').classList.add('hidden');
+    showToast(response.result.restartRequired
+      ? 'Text provider saved. Restart the agent to finish setup and activate it.'
+      : 'Text provider saved.');
+    renderProviderFields();
+  } catch (error) {
+    if (error.data?.code === 'API_KEY_REQUIRED') $('#text-provider-locked').classList.remove('hidden');
+    showToast(error.message, 'error');
+  } finally {
+    $('#loading').classList.remove('active');
+  }
 });
 
 const initialView = location.hash.slice(1);

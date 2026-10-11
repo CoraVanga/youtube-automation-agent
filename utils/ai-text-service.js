@@ -44,7 +44,27 @@ const PROVIDERS = {
     models: ['glm-5.3', 'glm-5.2', 'glm-5.1'],
     envKey: 'GLM_API_KEY',
   },
+  ollama: {
+    name: 'Ollama (local)',
+    baseURL: 'http://localhost:11434/v1',
+    defaultModel: '',
+    // Installed models vary per machine, so the UI lists them from the running
+    // server instead of a fixed catalogue.
+    models: [],
+    envKey: 'OLLAMA_BASE_URL',
+    // Ollama needs no credential; the OpenAI SDK still requires a non-empty key.
+    local: true,
+  },
 };
+
+const OLLAMA_PLACEHOLDER_KEY = 'ollama';
+
+function defaultOllamaBaseURL() {
+  const configured = String(process.env.OLLAMA_BASE_URL || process.env.OLLAMA_HOST || '').trim();
+  if (!configured) return PROVIDERS.ollama.baseURL;
+  const withScheme = /^https?:\/\//i.test(configured) ? configured : `http://${configured}`;
+  return withScheme.replace(/\/+$/, '').endsWith('/v1') ? withScheme.replace(/\/+$/, '') : `${withScheme.replace(/\/+$/, '')}/v1`;
+}
 
 class AITextService {
   constructor(credentials = {}) {
@@ -58,18 +78,26 @@ class AITextService {
   }
 
   _init(credentials) {
-    const provider = credentials.aiProvider?.provider;
-    const apiKey = credentials.aiProvider?.apiKey;
-    const model = credentials.aiProvider?.model;
+    const configured = credentials.aiProvider || {};
+    const provider = configured.provider;
+    const apiKey = configured.apiKey;
+    const model = configured.model;
+    const preset = provider ? PROVIDERS[provider] : null;
 
-    if (provider && PROVIDERS[provider] && apiKey) {
-      return this._initOpenAICompatible(PROVIDERS[provider], apiKey, model);
+    // A local provider is selected by its base URL, not by holding a key.
+    if (preset?.local) {
+      return this._initOpenAICompatible(preset, OLLAMA_PLACEHOLDER_KEY, model, configured);
     }
 
-    for (const [, preset] of Object.entries(PROVIDERS)) {
-      const key = process.env[preset.envKey];
+    if (preset && apiKey) {
+      return this._initOpenAICompatible(preset, apiKey, model, configured);
+    }
+
+    for (const [, candidate] of Object.entries(PROVIDERS)) {
+      if (candidate.local) continue;
+      const key = process.env[candidate.envKey];
       if (key) {
-        return this._initOpenAICompatible(preset, key);
+        return this._initOpenAICompatible(candidate, key);
       }
     }
 
@@ -78,14 +106,30 @@ class AITextService {
       return this._initGemini(geminiKey, credentials.gemini?.model);
     }
 
+    // Checked last so an explicit cloud key still wins, matching prior behaviour.
+    if (process.env.OLLAMA_BASE_URL || process.env.OLLAMA_HOST) {
+      return this._initOpenAICompatible(PROVIDERS.ollama, OLLAMA_PLACEHOLDER_KEY, process.env.OLLAMA_MODEL);
+    }
+
     this.logger.warn('No AI text provider configured — text generation unavailable');
   }
 
-  _initOpenAICompatible(preset, apiKey, model) {
-    this.client = new OpenAI({ apiKey, baseURL: preset.baseURL });
+  _initOpenAICompatible(preset, apiKey, model, configured = {}) {
+    const baseURL = preset.local
+      ? (configured.baseURL || defaultOllamaBaseURL())
+      : preset.baseURL;
+
+    this.client = new OpenAI({ apiKey: apiKey || OLLAMA_PLACEHOLDER_KEY, baseURL });
     this.model = model || preset.defaultModel;
     this.providerName = preset.name;
-    this.logger.info(`${preset.name} initialized (model: ${this.model})`);
+    this.baseURL = baseURL;
+    // Reasoning models emit hidden reasoning tokens that consume the same budget
+    // as the answer, so a 1800-token cap can return empty content. 'none' is the
+    // only switch the OpenAI-compatible path honours.
+    this.reasoningEffort = configured.disableReasoning ? 'none' : null;
+
+    const detail = preset.local ? `${this.model || 'no model selected'} @ ${baseURL}` : `model: ${this.model}`;
+    this.logger.info(`${preset.name} initialized (${detail})`);
   }
 
   _initGemini(apiKey, model) {
@@ -130,6 +174,7 @@ class AITextService {
       model,
       messages: [{ role: 'user', content: prompt }],
       temperature,
+      ...(this.reasoningEffort ? { reasoning_effort: this.reasoningEffort } : {}),
     };
 
     const tokenParams = [
@@ -146,6 +191,18 @@ class AITextService {
       } catch (error) {
         lastError = error;
         const message = error?.message || '';
+        // Providers that have never seen reasoning_effort reject the whole
+        // request; drop the hint rather than failing the generation.
+        if (error?.status === 400 && /reasoning_effort/i.test(message) && request.reasoning_effort) {
+          const { reasoning_effort: _effort, ...withoutEffort } = request;
+          try {
+            const response = await this.client.chat.completions.create(withoutEffort);
+            return this._extractContent(response);
+          } catch (retryError) {
+            lastError = retryError;
+          }
+        }
+
         const unsupportedTemperature =
           error?.status === 400 &&
           /temperature/i.test(message) &&
@@ -179,17 +236,20 @@ class AITextService {
   }
 
   _extractContent(response) {
-    const content =
-      response &&
-      response.choices &&
-      response.choices[0] &&
-      response.choices[0].message
-        ? response.choices[0].message.content
-        : null;
+    const message =
+      response && response.choices && response.choices[0] ? response.choices[0].message : null;
+    const content = message ? message.content : null;
 
     if (typeof content !== 'string' || !content.trim()) {
       // A null/empty body used to surface as cryptic "Unexpected end of JSON input"
       // in the agents' JSON parsers. Report the real cause instead.
+      const reasoning = message && (message.reasoning || message.reasoning_content);
+      if (reasoning && !this.reasoningEffort) {
+        throw new Error(
+          `${this.providerName} spent the whole token budget on reasoning and returned no answer. ` +
+          'Turn on "Disable model reasoning" for this provider, or pick a non-reasoning model.'
+        );
+      }
       throw new Error(
         `${this.providerName} returned an empty response. Check the API key and model quota.`
       );
@@ -202,4 +262,35 @@ class AITextService {
   }
 }
 
-module.exports = { AITextService, PROVIDERS, GEMINI_MODELS, GEMINI_DEFAULT_MODEL };
+// Lists the models installed on a running Ollama server so the operator picks
+// from what actually exists instead of typing a name. Cloud-hosted ":cloud" tags
+// are excluded — they are not local inference.
+async function listOllamaModels(baseURL) {
+  const root = String(baseURL || defaultOllamaBaseURL()).replace(/\/v1\/?$/, '');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4000);
+  try {
+    const response = await fetch(`${root}/api/tags`, { signal: controller.signal });
+    if (!response.ok) throw new Error(`Ollama responded with ${response.status}`);
+    const body = await response.json();
+    return (body.models || [])
+      .filter(model => !String(model.name || '').endsWith(':cloud'))
+      .map(model => ({
+        name: model.name,
+        parameterSize: model.details?.parameter_size || null,
+        quantization: model.details?.quantization_level || null,
+        sizeBytes: model.size ?? null,
+      }));
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+module.exports = {
+  AITextService,
+  PROVIDERS,
+  GEMINI_MODELS,
+  GEMINI_DEFAULT_MODEL,
+  listOllamaModels,
+  defaultOllamaBaseURL,
+};

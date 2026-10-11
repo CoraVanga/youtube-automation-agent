@@ -4,7 +4,43 @@ const { google } = require('googleapis');
 const inquirer = require('inquirer');
 const chalk = require('chalk');
 const { Logger } = require('./logger');
-const { PROVIDERS, GEMINI_MODELS, GEMINI_DEFAULT_MODEL } = require('./ai-text-service');
+const {
+  PROVIDERS,
+  GEMINI_MODELS,
+  GEMINI_DEFAULT_MODEL,
+  defaultOllamaBaseURL,
+} = require('./ai-text-service');
+
+// Enough to tell two keys apart in the dashboard without ever shipping one.
+function maskSecret(value) {
+  const text = typeof value === 'string' ? value.trim() : '';
+  if (!text) return null;
+  return text.length <= 4 ? '••••' : `••••${text.slice(-4)}`;
+}
+
+// The base URL becomes an address this process sends prompts to, so it is
+// parsed and scheme-checked rather than trusted as typed.
+function normalizeLocalBaseURL(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return defaultOllamaBaseURL();
+
+  // Only a bare host:port gets http:// added. An explicit scheme is kept so the
+  // check below can reject it, rather than being mangled into a bogus http URL.
+  const hasScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(raw);
+  const withScheme = hasScheme ? raw : `http://${raw}`;
+  let parsed;
+  try {
+    parsed = new URL(withScheme);
+  } catch {
+    throw Object.assign(new Error('Base URL is not a valid address'), { status: 400 });
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw Object.assign(new Error('Base URL must use http or https'), { status: 400 });
+  }
+
+  const trimmed = `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, '');
+  return trimmed.endsWith('/v1') ? trimmed : `${trimmed}/v1`;
+}
 
 class CredentialManager {
   constructor() {
@@ -42,6 +78,108 @@ class CredentialManager {
     } catch (error) {
       this.tokens = {};
     }
+  }
+
+  // Everything the dashboard is allowed to see. Secrets never leave this method
+  // intact — only whether one is stored and its last four characters, which is
+  // enough for the operator to tell two keys apart.
+  describeTextProvider() {
+    const configured = this.credentials.aiProvider || {};
+    const preset = configured.provider ? PROVIDERS[configured.provider] : null;
+    const geminiKey = this.credentials.gemini?.apiKey || process.env.GEMINI_API_KEY;
+
+    let active = null;
+    if (preset?.local) active = configured.provider;
+    else if (preset && configured.apiKey) active = configured.provider;
+    else if (geminiKey) active = 'gemini';
+
+    const providers = Object.entries(PROVIDERS).map(([id, entry]) => ({
+      id,
+      name: entry.name,
+      local: Boolean(entry.local),
+      models: entry.models,
+      defaultModel: entry.defaultModel,
+      keyConfigured: id === configured.provider ? Boolean(configured.apiKey) : false,
+      keyHint: id === configured.provider ? maskSecret(configured.apiKey) : null,
+    }));
+
+    providers.push({
+      id: 'gemini',
+      name: 'Google Gemini',
+      local: false,
+      models: GEMINI_MODELS,
+      defaultModel: GEMINI_DEFAULT_MODEL,
+      keyConfigured: Boolean(geminiKey),
+      keyHint: maskSecret(geminiKey),
+    });
+
+    return {
+      active,
+      model: active === 'gemini' ? this.credentials.gemini?.model || GEMINI_DEFAULT_MODEL : configured.model || null,
+      baseURL: preset?.local ? configured.baseURL || defaultOllamaBaseURL() : null,
+      disableReasoning: Boolean(configured.disableReasoning),
+      providers,
+    };
+  }
+
+  // Applies a provider change from the dashboard. Returns the validated shape so
+  // the caller can report exactly what was stored.
+  async setTextProvider(input = {}) {
+    const providerId = String(input.provider || '').trim();
+
+    if (providerId === 'gemini') {
+      const apiKey = typeof input.apiKey === 'string' ? input.apiKey.trim() : '';
+      if (!apiKey && !this.credentials.gemini?.apiKey) {
+        throw Object.assign(new Error('Gemini requires an API key'), { status: 400 });
+      }
+      this.credentials.gemini = {
+        apiKey: apiKey || this.credentials.gemini.apiKey,
+        model: String(input.model || '').trim() || GEMINI_DEFAULT_MODEL,
+      };
+      delete this.credentials.aiProvider;
+      await this.saveCredentials();
+      return this.describeTextProvider();
+    }
+
+    const preset = PROVIDERS[providerId];
+    if (!preset) {
+      throw Object.assign(new Error('Unsupported text provider'), { status: 400 });
+    }
+
+    if (preset.local) {
+      const baseURL = normalizeLocalBaseURL(input.baseURL);
+      const model = String(input.model || '').trim();
+      if (!model) {
+        throw Object.assign(new Error('Select a model from the local server'), { status: 400 });
+      }
+      this.credentials.aiProvider = {
+        provider: providerId,
+        baseURL,
+        model,
+        disableReasoning: input.disableReasoning === true,
+      };
+      await this.saveCredentials();
+      return this.describeTextProvider();
+    }
+
+    const existingKey =
+      this.credentials.aiProvider?.provider === providerId ? this.credentials.aiProvider.apiKey : null;
+    const apiKey = typeof input.apiKey === 'string' ? input.apiKey.trim() : '';
+    // An empty key means "keep the stored one", so re-saving the model does not
+    // force the operator to paste the secret again.
+    const resolvedKey = apiKey || existingKey;
+    if (!resolvedKey) {
+      throw Object.assign(new Error(`${preset.name} requires an API key`), { status: 400 });
+    }
+
+    this.credentials.aiProvider = {
+      provider: providerId,
+      apiKey: resolvedKey,
+      model: String(input.model || '').trim() || preset.defaultModel,
+      disableReasoning: input.disableReasoning === true,
+    };
+    await this.saveCredentials();
+    return this.describeTextProvider();
   }
 
   async saveCredentials() {
@@ -520,6 +658,12 @@ class CredentialManager {
       return true;
     }
 
+    // A local provider proves itself with a chosen model, not a key.
+    const configured = this.credentials.aiProvider;
+    if (configured?.provider && PROVIDERS[configured.provider]?.local && configured.model) {
+      return true;
+    }
+
     // Environment-variable based configuration (see utils/ai-text-service.js)
     const envKeys = [...Object.values(PROVIDERS).map(p => p.envKey), 'GEMINI_API_KEY'];
     return envKeys.some(key => process.env[key]);
@@ -533,7 +677,7 @@ class CredentialManager {
     }
 
     if (!this.hasAITextProvider()) {
-      missing.push('an AI provider (OpenAI, Gemini, OpenRouter, Kimi, MiMo, or GLM)');
+      missing.push('an AI provider (OpenAI, Gemini, OpenRouter, Kimi, MiMo, GLM, or a local Ollama model)');
     }
 
     return missing;

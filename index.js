@@ -25,7 +25,7 @@ const { SceneRepairService } = require('./utils/scene-repair-service');
 const { ShortsRepurposingService } = require('./utils/shorts-repurposing-service');
 const { AudienceEngagementService } = require('./utils/audience-engagement-service');
 const { GrowthExperimentService } = require('./utils/growth-experiment-service');
-const { AITextService } = require('./utils/ai-text-service');
+const { AITextService, listOllamaModels } = require('./utils/ai-text-service');
 const { DiscoverabilityService } = require('./utils/discoverability-service');
 const { version } = require('./package.json');
 const chalk = require('chalk');
@@ -248,6 +248,23 @@ class YouTubeAutomationAgent {
     }
   }
 
+  // Agents build their AITextService once, so a provider change from the
+  // dashboard would otherwise only take effect after a restart.
+  refreshTextProviders() {
+    const credentials = this.credentials?.credentials || {};
+    const holders = [
+      this.agents.strategy,
+      this.agents.scriptWriter,
+      this.agents.seoOptimizer,
+      this.engagement,
+    ].filter(holder => holder && holder.aiTextService);
+
+    for (const holder of holders) {
+      holder.aiTextService = new AITextService(credentials);
+    }
+    return holders.length;
+  }
+
   async logCapabilitySummary() {
     const { checkFFmpeg, ffmpegInstallHint } = require('./utils/ffmpeg');
     const creds = this.credentials.credentials || {};
@@ -305,6 +322,27 @@ class YouTubeAutomationAgent {
         success: false,
         error: 'API_KEY must be set when HOST binds to a non-loopback address'
       });
+    };
+  }
+
+  // Writing provider secrets through the web API is the one route where an
+  // unset API_KEY cannot be tolerated: another user on this machine can still
+  // reach 127.0.0.1 and would otherwise be able to overwrite the operator's
+  // provider with their own.
+  requireDashboardKey() {
+    return (req, res, next) => {
+      const configured = process.env.API_KEY;
+      if (!configured) {
+        return res.status(403).json({
+          success: false,
+          error: 'Set API_KEY in .env to change provider credentials from the dashboard',
+          code: 'API_KEY_REQUIRED'
+        });
+      }
+      if (req.get('x-api-key') !== configured) {
+        return res.status(401).json({ success: false, error: 'Unauthorized' });
+      }
+      return next();
     };
   }
 
@@ -1343,6 +1381,49 @@ class YouTubeAutomationAgent {
         return res.status(400).json({ error: 'Action must be pause or resume' });
       }
       return res.json({ success: true, paused: !this.scheduler.isEnabled });
+    });
+
+    // Reports which text provider is active and whether each one holds a key.
+    // describeTextProvider() masks every secret before it reaches this response.
+    this.app.get('/api/providers/text', protect, async (_req, res) => {
+      try {
+        return res.json({ success: true, result: this.credentials.describeTextProvider() });
+      } catch (error) {
+        return res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    this.app.put('/api/providers/text', this.requireDashboardKey(), async (req, res) => {
+      try {
+        const result = await this.credentials.setTextProvider(req.body || {});
+        const refreshed = this.refreshTextProviders();
+        // In setup mode no agent exists yet, so a provider change cannot take
+        // effect until the process builds them on the next start.
+        result.restartRequired = this.setupRequired;
+        this.logger.info(`Text provider set to ${result.active || 'none'} (${refreshed} consumer(s) reloaded)`);
+        // Provider and model only — the key itself is never written to the log.
+        await this.db.executeQuery(
+          'INSERT INTO automation_events (event_type, status, data, created_at) VALUES (?, ?, ?, datetime("now"))',
+          ['text_provider_change', 'success', JSON.stringify({ provider: result.active, model: result.model })]
+        );
+        return res.json({ success: true, result });
+      } catch (error) {
+        return res.status(error.status || 500).json({ success: false, error: error.message });
+      }
+    });
+
+    // Lets the dashboard list what is installed locally instead of making the
+    // operator type a model name by hand.
+    this.app.get('/api/providers/ollama/models', protect, async (req, res) => {
+      try {
+        const models = await listOllamaModels(req.query.baseURL);
+        return res.json({ success: true, result: models });
+      } catch (error) {
+        return res.status(502).json({
+          success: false,
+          error: `Could not reach the local Ollama server: ${error.message}`
+        });
+      }
     });
 
     this.app.put('/api/settings', protect, async (req, res) => {
