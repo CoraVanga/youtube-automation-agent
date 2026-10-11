@@ -134,7 +134,8 @@ class ModernAuth {
             
             // Save tokens
             const tokenData = { youtube: tokens };
-            fs.writeFileSync(this.tokensPath, JSON.stringify(tokenData, null, 2));
+            fs.writeFileSync(this.tokensPath, JSON.stringify(tokenData, null, 2), { mode: 0o600 });
+            fs.chmodSync(this.tokensPath, 0o600);
             
             res.writeHead(200, { 'Content-Type': 'text/html' });
             res.end(`

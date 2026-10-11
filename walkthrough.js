@@ -230,14 +230,16 @@ class SetupWalkthrough {
       await fs.access(path.join(__dirname, '.env'));
       console.log(chalk.green('  ✓ .env file'));
     } catch (error) {
-      await fs.writeFile(path.join(__dirname, '.env'), [
+      const envPath = path.join(__dirname, '.env');
+      await fs.writeFile(envPath, [
         '# Created by the guided walkthrough — see .env.example for every option',
         'NODE_ENV=production',
         'PORT=3456',
         'LOG_LEVEL=info',
         'DEFAULT_PRIVACY_STATUS=private',
         ''
-      ].join('\n'));
+      ].join('\n'), { mode: 0o600 });
+      await fs.chmod(envPath, 0o600);
       console.log(chalk.green('  ✓ .env file created'));
     }
   }

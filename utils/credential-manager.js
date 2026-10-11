@@ -45,13 +45,16 @@ class CredentialManager {
   }
 
   async saveCredentials() {
-    await fs.mkdir(path.dirname(this.credentialsPath), { recursive: true });
-    await fs.writeFile(this.credentialsPath, JSON.stringify(this.credentials, null, 2));
+    await fs.mkdir(path.dirname(this.credentialsPath), { recursive: true, mode: 0o700 });
+    await fs.writeFile(this.credentialsPath, JSON.stringify(this.credentials, null, 2), { mode: 0o600 });
+    // writeFile leaves the mode untouched when the file already exists.
+    await fs.chmod(this.credentialsPath, 0o600);
   }
 
   async saveTokens() {
-    await fs.mkdir(path.dirname(this.tokensPath), { recursive: true });
-    await fs.writeFile(this.tokensPath, JSON.stringify(this.tokens, null, 2));
+    await fs.mkdir(path.dirname(this.tokensPath), { recursive: true, mode: 0o700 });
+    await fs.writeFile(this.tokensPath, JSON.stringify(this.tokens, null, 2), { mode: 0o600 });
+    await fs.chmod(this.tokensPath, 0o600);
   }
 
   // YouTube API Authentication

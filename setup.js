@@ -169,7 +169,9 @@ SAVE_SCREENSHOTS=false
 SCREENSHOT_PATH=./debug/screenshots
 `;
 
-    await fs.writeFile(path.join(__dirname, '.env'), envContent);
+    const envPath = path.join(__dirname, '.env');
+    await fs.writeFile(envPath, envContent, { mode: 0o600 });
+    await fs.chmod(envPath, 0o600);
     console.log(chalk.green('✅ Environment file created'));
   }
 

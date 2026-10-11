@@ -30,6 +30,82 @@ const { DiscoverabilityService } = require('./utils/discoverability-service');
 const { version } = require('./package.json');
 const chalk = require('chalk');
 
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '0:0:0:0:0:0:0:1']);
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+// The dashboard holds YouTube OAuth tokens and paid provider keys, so it binds to
+// loopback unless the operator opts out explicitly with HOST.
+function resolveBindHost() {
+  const configured = String(process.env.HOST || '').trim();
+  return configured || '127.0.0.1';
+}
+
+function stripPort(hostHeader) {
+  const value = String(hostHeader || '').trim();
+  if (!value) return '';
+  if (value.startsWith('[')) return value.slice(1, value.indexOf(']')).toLowerCase();
+  const [hostname] = value.split(':');
+  return hostname.toLowerCase();
+}
+
+function isLoopbackHostname(hostname) {
+  const value = stripPort(hostname);
+  return LOOPBACK_HOSTNAMES.has(value) || value.startsWith('127.');
+}
+
+function allowedHostnames() {
+  const extra = String(process.env.ALLOWED_HOSTS || '')
+    .split(',')
+    .map(entry => stripPort(entry))
+    .filter(Boolean);
+  return new Set([...LOOPBACK_HOSTNAMES, stripPort(resolveBindHost()), ...extra].filter(Boolean));
+}
+
+// Rejecting unexpected Host headers is what stops DNS rebinding from turning a
+// loopback-only bind back into a remotely reachable API.
+function isAllowedHost(hostHeader) {
+  const hostname = stripPort(hostHeader);
+  if (!hostname) return false;
+  if (isLoopbackHostname(hostname)) return true;
+  return allowedHostnames().has(hostname);
+}
+
+// Compared by host rather than full origin so a TLS-terminating reverse proxy,
+// where req.protocol is http but the browser reports https, is not rejected.
+function matchesRequestHost(value, req) {
+  const host = req.get('host');
+  if (!host || !value) return false;
+  try {
+    return new URL(value).host.toLowerCase() === host.toLowerCase();
+  } catch {
+    return false;
+  }
+}
+
+// Browsers always send Origin on cross-origin mutations, so a mismatch is CSRF.
+// A request with none of these headers is a non-browser client (curl, scripts,
+// CI) and therefore cannot be a CSRF victim.
+function isSameOriginRequest(req) {
+  const origin = req.get('origin');
+  if (origin) return matchesRequestHost(origin, req);
+
+  const fetchSite = req.get('sec-fetch-site');
+  if (fetchSite) return fetchSite === 'same-origin' || fetchSite === 'none';
+
+  const referer = req.get('referer');
+  if (referer) return matchesRequestHost(referer, req);
+
+  return true;
+}
+
+// <img>/<video> cannot carry an x-api-key header, so same-origin asset reads are
+// authenticated by the browser's own origin signals instead.
+function isSameOriginAssetRead(req) {
+  const fetchSite = req.get('sec-fetch-site');
+  if (fetchSite) return fetchSite === 'same-origin';
+  return matchesRequestHost(req.get('referer'), req);
+}
+
 class YouTubeAutomationAgent {
   constructor() {
     this.logger = new Logger('MainAgent');
@@ -212,14 +288,50 @@ class YouTubeAutomationAgent {
     return { hasText, hasImages, hasTTS, hasFFmpeg, hasUpload };
   }
 
-  requireAPIKey() {
+  requireAPIKey({ allowSameOrigin = false } = {}) {
     return (req, res, next) => {
-      if (!process.env.API_KEY) {
-        return next();
+      const configured = process.env.API_KEY;
+
+      if (configured) {
+        if (req.get('x-api-key') === configured) return next();
+        if (allowSameOrigin && isSameOriginAssetRead(req)) return next();
+        return res.status(401).json({ success: false, error: 'Unauthorized' });
       }
 
-      if (req.get('x-api-key') !== process.env.API_KEY) {
-        return res.status(401).json({ success: false, error: 'Unauthorized' });
+      // Without a key the API is only safe because nothing off-host can reach it.
+      if (isLoopbackHostname(resolveBindHost())) return next();
+
+      return res.status(401).json({
+        success: false,
+        error: 'API_KEY must be set when HOST binds to a non-loopback address'
+      });
+    };
+  }
+
+  securityHeaders() {
+    return (req, res, next) => {
+      res.setHeader('X-Frame-Options', 'DENY');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Referrer-Policy', 'same-origin');
+      res.setHeader('Content-Security-Policy', [
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+        "font-src 'self' https://fonts.gstatic.com",
+        "img-src 'self' data: blob:",
+        "media-src 'self' blob:",
+        "connect-src 'self'",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "frame-ancestors 'none'"
+      ].join('; '));
+
+      if (!isAllowedHost(req.get('host'))) {
+        return res.status(403).json({ success: false, error: 'Forbidden host' });
+      }
+
+      if (MUTATING_METHODS.has(req.method) && !isSameOriginRequest(req)) {
+        return res.status(403).json({ success: false, error: 'Cross-origin request rejected' });
       }
 
       return next();
@@ -373,13 +485,17 @@ class YouTubeAutomationAgent {
     };
   }
   setupAPI() {
+    this.app.disable('x-powered-by');
+    this.app.use(this.securityHeaders());
     this.app.use(express.json({ limit: '1mb' }));
     this.app.use(express.static(path.join(__dirname, 'dashboard')));
 
     if (!process.env.API_KEY) {
-      this.logger.warn('API_KEY is not set; mutating API routes are unprotected');
+      this.logger.warn('API_KEY is not set; the API is reachable by any process on this host');
     }
-    
+
+    const protect = this.requireAPIKey();
+
     // Main dashboard route
     this.app.get('/', (req, res) => {
       res.sendFile(path.join(__dirname, 'dashboard', 'index.html'));
@@ -417,7 +533,7 @@ class YouTubeAutomationAgent {
     });
 
     // Get analytics
-    this.app.get('/analytics', async (req, res) => {
+    this.app.get('/analytics', protect, async (req, res) => {
       try {
         if (!this.agents.analytics) return res.json({ totalVideos: 0, averagePerformanceScore: 0, topPerformers: [], insights: [], learning: null });
         const analytics = await this.agents.analytics.getRecentAnalytics();
@@ -428,7 +544,7 @@ class YouTubeAutomationAgent {
       }
     });
 
-    this.app.get('/api/outcomes', async (_req, res) => {
+    this.app.get('/api/outcomes', protect, async (_req, res) => {
       try {
         const learning = this.agents.analytics?.getLearningSummary
           ? await this.agents.analytics.getLearningSummary()
@@ -440,7 +556,7 @@ class YouTubeAutomationAgent {
     });
 
     // Get upcoming schedule
-    this.app.get('/schedule', async (req, res) => {
+    this.app.get('/schedule', protect, async (req, res) => {
       try {
         const schedule = await this.db.getUpcomingSchedule();
         res.json(schedule);
@@ -471,8 +587,9 @@ class YouTubeAutomationAgent {
 
   setupOperatorAPI() {
     const protect = this.requireAPIKey();
+    const protectAsset = this.requireAPIKey({ allowSameOrigin: true });
 
-    this.app.get('/api/dashboard', async (_req, res) => {
+    this.app.get('/api/dashboard', protect, async (_req, res) => {
       try {
         const [stats, jobs, pipeline, schedule, events, notifications, profile, settings, ideas, analytics, learning, activation, channelStrategy, operatorRuns, readiness, engagement, experiments] = await Promise.all([
           this.db.getStats(),
@@ -530,7 +647,7 @@ class YouTubeAutomationAgent {
       }
     });
 
-    this.app.get('/api/jobs/:jobId', async (req, res) => {
+    this.app.get('/api/jobs/:jobId', protect, async (req, res) => {
       const job = await this.db.getGenerationJob(req.params.jobId);
       if (!job) return res.status(404).json({ error: 'Job not found' });
       job.checkpoints = await this.db.listGenerationCheckpoints(job.id);
@@ -548,7 +665,7 @@ class YouTubeAutomationAgent {
       }
     });
 
-    this.app.get('/api/readiness', async (_req, res) => {
+    this.app.get('/api/readiness', protect, async (_req, res) => {
       if (!this.readiness) return res.status(503).json({ error: 'Readiness service is not initialized' });
       return res.json(await this.readiness.getSummary());
     });
@@ -576,7 +693,7 @@ class YouTubeAutomationAgent {
       return res.json({ success: true, result: updated });
     });
 
-    this.app.get('/api/content/:productionId', async (req, res) => {
+    this.app.get('/api/content/:productionId', protect, async (req, res) => {
       let bundle = await this.db.getProductionBundle(req.params.productionId);
       if (!bundle) return res.status(404).json({ error: 'Content not found' });
       if (this.scenes && !bundle.scenes?.length) {
@@ -586,7 +703,7 @@ class YouTubeAutomationAgent {
       return res.json(this.decorateContentBundle(bundle));
     });
 
-    this.app.get('/api/content/:productionId/scenes/:sceneId/estimate', async (req, res) => {
+    this.app.get('/api/content/:productionId/scenes/:sceneId/estimate', protect, async (req, res) => {
       try {
         if (!this.scenes) return res.status(503).json({ error: 'Scene repair requires completed setup' });
         const result = await this.scenes.regenerationEstimate(req.params.productionId, req.params.sceneId, {
@@ -674,7 +791,7 @@ class YouTubeAutomationAgent {
       }
     });
 
-    this.app.get('/api/content/:productionId/shorts/:clipId/asset/:kind', async (req, res) => {
+    this.app.get('/api/content/:productionId/shorts/:clipId/asset/:kind', protectAsset, async (req, res) => {
       try {
         const clip = await this.db.getShortClip(req.params.clipId);
         if (!clip || clip.productionId !== req.params.productionId) return res.status(404).json({ error: 'Short asset not found' });
@@ -748,7 +865,7 @@ class YouTubeAutomationAgent {
       }
     });
 
-    this.app.get('/api/content/:productionId/scenes/:sceneId/asset', async (req, res) => {
+    this.app.get('/api/content/:productionId/scenes/:sceneId/asset', protectAsset, async (req, res) => {
       try {
         const scene = await this.db.getProductionScene(req.params.productionId, req.params.sceneId);
         if (!scene?.assetPath) return res.status(404).json({ error: 'Scene asset not found' });
@@ -818,7 +935,7 @@ class YouTubeAutomationAgent {
       return res.status(202).json({ success: true, result: job });
     });
 
-    this.app.get('/api/content/:productionId/asset/:kind', async (req, res) => {
+    this.app.get('/api/content/:productionId/asset/:kind', protectAsset, async (req, res) => {
       try {
         const bundle = await this.db.getProductionBundle(req.params.productionId);
         if (!bundle) return res.status(404).json({ error: 'Content not found' });
@@ -1031,7 +1148,7 @@ class YouTubeAutomationAgent {
       }
     });
 
-    this.app.get('/api/experiments', async (_req, res) => {
+    this.app.get('/api/experiments', protect, async (_req, res) => {
       try {
         const summary = this.experiments
           ? await this.experiments.getSummary()
@@ -1077,7 +1194,7 @@ class YouTubeAutomationAgent {
       }
     });
 
-    this.app.get('/api/retention/:videoId', async (req, res) => {
+    this.app.get('/api/retention/:videoId', protect, async (req, res) => {
       const videoId = String(req.params.videoId || '').trim();
       if (!/^[A-Za-z0-9_-]{1,100}$/.test(videoId)) {
         return res.status(400).json({ error: 'A valid YouTube video ID is required' });
@@ -1112,7 +1229,7 @@ class YouTubeAutomationAgent {
 
     const ENGAGEMENT_VIDEO_ID = /^[A-Za-z0-9_-]{1,100}$/;
 
-    this.app.get('/api/engagement/:videoId', async (req, res) => {
+    this.app.get('/api/engagement/:videoId', protect, async (req, res) => {
       try {
         const videoId = String(req.params.videoId || '').trim();
         if (!ENGAGEMENT_VIDEO_ID.test(videoId)) {
@@ -1825,21 +1942,42 @@ class YouTubeAutomationAgent {
 
   async start() {
     const initialized = await this.initialize();
-    
+
     if (!initialized) {
       console.log(chalk.red('\n❌ Failed to initialize. Please check your configuration.'));
       process.exit(1);
     }
-    
+
+    const HOST = resolveBindHost();
+    const exposed = !isLoopbackHostname(HOST);
+
+    if (exposed && !process.env.API_KEY) {
+      console.log(chalk.red(`\n❌ HOST is set to ${HOST}, which is reachable off this machine.`));
+      console.log(chalk.red('   Set API_KEY in .env before exposing the dashboard, or unset HOST.'));
+      process.exit(1);
+    }
+
+    // Registered after every route so a rejected handler returns 500 instead of
+    // killing the process and taking the scheduler down with it.
+    this.app.use((error, req, res, _next) => {
+      this.logger.error('Unhandled request error', error);
+      if (res.headersSent) return;
+      res.status(error.status || 500).json({ success: false, error: 'Internal server error' });
+    });
+
     const PORT = process.env.PORT || 3456;
-    this.app.listen(PORT, () => {
-      console.log(chalk.green(`\n✅ YouTube Automation Agent running on port ${PORT}`));
+    const displayHost = isLoopbackHostname(HOST) ? 'localhost' : HOST;
+    this.app.listen(PORT, HOST, () => {
+      console.log(chalk.green(`\n✅ YouTube Automation Agent running on ${HOST}:${PORT}`));
       console.log(chalk.gray('─'.repeat(50)));
-      console.log(chalk.white('📊 Dashboard: ') + chalk.cyan(`http://localhost:${PORT}`));
-      console.log(chalk.white('🔧 API Health: ') + chalk.cyan(`http://localhost:${PORT}/health`));
-      console.log(chalk.white('📅 Schedule: ') + chalk.cyan(`http://localhost:${PORT}/schedule`));
-      console.log(chalk.white('📈 Analytics: ') + chalk.cyan(`http://localhost:${PORT}/analytics`));
+      console.log(chalk.white('📊 Dashboard: ') + chalk.cyan(`http://${displayHost}:${PORT}`));
+      console.log(chalk.white('🔧 API Health: ') + chalk.cyan(`http://${displayHost}:${PORT}/health`));
+      console.log(chalk.white('📅 Schedule: ') + chalk.cyan(`http://${displayHost}:${PORT}/schedule`));
+      console.log(chalk.white('📈 Analytics: ') + chalk.cyan(`http://${displayHost}:${PORT}/analytics`));
       console.log(chalk.gray('─'.repeat(50)));
+      if (exposed) {
+        console.log(chalk.yellow(`\n⚠️  Bound to ${HOST}; the API is reachable from the network and requires x-api-key.`));
+      }
       if (this.setupRequired) {
         console.log(chalk.yellow('\n⚙️  Setup is required. The dashboard is available; run npm run walkthrough to enable generation.'));
       } else {
@@ -1851,6 +1989,15 @@ class YouTubeAutomationAgent {
 
 // Start the agent
 if (require.main === module) {
+  // A rejected promise anywhere in the scheduler or a provider SDK would otherwise
+  // terminate the process and silently stop all pending publishing.
+  process.on('unhandledRejection', reason => {
+    console.error(chalk.red('Unhandled promise rejection:'), reason);
+  });
+  process.on('uncaughtException', error => {
+    console.error(chalk.red('Uncaught exception:'), error);
+  });
+
   const agent = new YouTubeAutomationAgent();
   agent.start().catch(error => {
     console.error(chalk.red('Fatal error:'), error);
