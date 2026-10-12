@@ -31,14 +31,36 @@ const MEDIA_PROVIDERS = {
       name: 'OpenAI TTS',
       store: 'openai',
       sharedWith: 'OpenAI text and image generation',
-      fields: [{ name: 'apiKey', label: 'API key', secret: true, env: 'OPENAI_API_KEY' }]
+      fields: [
+        { name: 'apiKey', label: 'API key', secret: true, env: 'OPENAI_API_KEY' },
+        {
+          name: 'ttsVoice',
+          label: 'Voice',
+          secret: false,
+          optional: true,
+          env: 'OPENAI_TTS_VOICE',
+          fallback: 'coral',
+          help: 'Any voice name the provider accepts. Leave empty for the default.'
+        }
+      ]
     },
     {
       id: 'gemini',
       name: 'Gemini TTS',
       store: 'gemini',
       sharedWith: 'Gemini text and image generation',
-      fields: [{ name: 'apiKey', label: 'API key', secret: true, env: 'GEMINI_API_KEY' }]
+      fields: [
+        { name: 'apiKey', label: 'API key', secret: true, env: 'GEMINI_API_KEY' },
+        {
+          name: 'ttsVoice',
+          label: 'Voice',
+          secret: false,
+          optional: true,
+          env: 'GEMINI_TTS_VOICE',
+          fallback: 'Kore',
+          help: 'Any prebuilt voice name the provider accepts. Leave empty for the default.'
+        }
+      ]
     }
   ],
   video: [
@@ -202,10 +224,16 @@ class CredentialManager {
         name: field.name,
         label: field.label,
         secret: field.secret,
+        optional: Boolean(field.optional),
+        help: field.help || null,
         env: field.env,
         configured: Boolean(value),
         fromEnvironment: Boolean(!stored && fromEnv),
-        hint: value ? (field.secret ? maskSecret(value) : value) : null
+        hint: value ? (field.secret ? maskSecret(value) : value) : null,
+        // What the pipeline will actually use, so an unset optional field can
+        // show its built-in default instead of looking broken. Never set for a
+        // secret: there is no safe way to show one, and nothing needs it.
+        effective: field.secret ? null : (value || field.fallback || null)
       };
     };
 
@@ -215,8 +243,8 @@ class CredentialManager {
         id: provider.id,
         name: provider.name,
         sharedWith: provider.sharedWith || null,
-        // Every field must be present before the provider can actually run.
-        ready: fields.every(field => field.configured),
+        // Optional fields carry a default, so only the required ones gate this.
+        ready: fields.filter(field => !field.optional).every(field => field.configured),
         fields
       };
     });
@@ -245,15 +273,23 @@ class CredentialManager {
 
     const values = input.values && typeof input.values === 'object' ? input.values : {};
     // Merge rather than replace: several providers share a store with the text
-    // and image configuration, and an empty field means "keep what is stored".
+    // and image configuration.
     const next = { ...(this.credentials[provider.store] || {}) };
 
     for (const field of provider.fields) {
       const supplied = typeof values[field.name] === 'string' ? values[field.name].trim() : '';
-      if (supplied) next[field.name] = supplied;
+      if (supplied) {
+        next[field.name] = supplied;
+      } else if (!field.secret && field.name in values) {
+        // Non-secret fields are shown filled in, so what the operator sees is
+        // what gets saved: clearing one really clears it. Secrets are never
+        // pre-filled, so an empty secret means "keep the stored value".
+        delete next[field.name];
+      }
     }
 
     const missing = provider.fields
+      .filter(field => !field.optional)
       .filter(field => !next[field.name] && !(field.env && process.env[field.env]))
       .map(field => field.label);
     if (missing.length) {

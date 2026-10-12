@@ -3706,6 +3706,37 @@ class SystemTest {
         throw new Error(`ElevenLabs should be the active narration provider, got ${state.activeTTS}`);
       }
 
+      // An optional field carries a default, so it must not hold the provider
+      // back, and its default has to be visible.
+      const openaiTTS = state.tts.find(provider => provider.id === 'openai');
+      const voiceField = openaiTTS.fields.find(field => field.name === 'ttsVoice');
+      if (!voiceField?.optional) {
+        throw new Error('The narration voice must be an optional field');
+      }
+      if (voiceField.effective !== 'coral') {
+        throw new Error(`An unset voice must report its default, got ${voiceField.effective}`);
+      }
+      for (const field of state.tts.concat(state.video).flatMap(provider => provider.fields)) {
+        if (field.secret && field.effective !== null) {
+          throw new Error(`Secret field ${field.name} exposed an effective value`);
+        }
+      }
+
+      await manager.setMediaProvider({ kind: 'tts', provider: 'openai', values: { apiKey: 'sk-tts-key-4321', ttsVoice: 'nova' } });
+      if (manager.credentials.openai.ttsVoice !== 'nova') {
+        throw new Error('The narration voice was not stored');
+      }
+
+      // Clearing a non-secret field returns it to the default, while the secret
+      // beside it survives because empty secrets mean "keep".
+      await manager.setMediaProvider({ kind: 'tts', provider: 'openai', values: { apiKey: '', ttsVoice: '' } });
+      if ('ttsVoice' in manager.credentials.openai) {
+        throw new Error('Clearing the voice must remove it so the default applies');
+      }
+      if (manager.credentials.openai.apiKey !== 'sk-tts-key-4321') {
+        throw new Error('An empty secret must keep the stored key');
+      }
+
       for (const bad of [{ kind: 'nope', provider: 'elevenlabs' }, { kind: 'tts', provider: 'nope' }]) {
         let status = null;
         try {

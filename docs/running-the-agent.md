@@ -108,6 +108,15 @@ If none of them is complete, narration is simulated, and a production with simul
 narration **cannot be approved, scheduled, or published**. The dashboard states which
 provider will be used.
 
+Each provider's voice sits next to its key in the dashboard:
+
+- **ElevenLabs** — the Voice ID field, which is also what makes the provider usable.
+- **OpenAI TTS** — a voice name; empty uses `coral`.
+- **Gemini TTS** — a prebuilt voice name; empty uses `Kore`.
+
+Clearing a voice restores that default. `OPENAI_TTS_VOICE` and `GEMINI_TTS_VOICE` set the
+same thing from the environment.
+
 Azure Speech is not offered. Credentials for it can still be stored by older setup
 flows, but no code path turns them into audio, so a setup relying on Azure alone
 produces simulated narration.

@@ -1903,15 +1903,18 @@ function renderMediaPanel(kind, provider) {
       input.placeholder = field.configured ? 'Leave empty to keep the stored value' : '';
     } else {
       input.type = 'text';
-      // A voice ID is not a credential, so it round-trips and stays editable.
+      // Non-secret fields round-trip, so clearing one really clears it.
       if (field.hint) input.value = field.hint;
+      if (field.optional && field.effective) input.placeholder = field.effective;
     }
 
     const hint = document.createElement('small');
-    if (!field.configured) hint.textContent = 'Not set.';
-    else if (field.fromEnvironment) hint.textContent = `Set by ${field.env} in your environment.`;
-    else if (field.secret) hint.textContent = `Stored, ending ${field.hint}.`;
-    else hint.textContent = 'Stored.';
+    if (field.fromEnvironment) hint.textContent = `Set by ${field.env} in your environment.`;
+    else if (field.configured && field.secret) hint.textContent = `Stored, ending ${field.hint}.`;
+    else if (field.configured) hint.textContent = 'Stored.';
+    else if (field.optional) hint.textContent = `Using the default: ${field.effective}.`;
+    else hint.textContent = 'Not set.';
+    if (field.help) hint.textContent += ` ${field.help}`;
 
     label.append(span, input, hint);
     grid.append(label);

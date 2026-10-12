@@ -50,6 +50,10 @@ class AIVideoGenerator {
     // ElevenLabs configuration
     this.elevenLabsApiKey = resolvedCredentials.elevenLabs?.apiKey || process.env.ELEVENLABS_API_KEY;
     this.elevenLabsVoiceId = resolvedCredentials.elevenLabs?.voiceId || process.env.ELEVENLABS_VOICE_ID;
+
+    // Narration voice per provider; the dashboard writes these next to the key.
+    this.openAITTSVoice = resolvedCredentials.openai?.ttsVoice || process.env.OPENAI_TTS_VOICE || 'coral';
+    this.geminiTTSVoice = resolvedCredentials.gemini?.ttsVoice || process.env.GEMINI_TTS_VOICE || 'Kore';
     this.elevenLabsModel = process.env.ELEVENLABS_TTS_MODEL || 'eleven_v3';
     
     // Azure Speech configuration
@@ -148,7 +152,7 @@ class AIVideoGenerator {
   async generateOpenAITTS(text, outputPath) {
     const response = await this.openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
-      voice: "coral",
+      voice: this.openAITTSVoice,
       input: text,
       speed: 1.0
     });
@@ -162,7 +166,7 @@ class AIVideoGenerator {
 
   async generateGeminiTTS(text, outputPath) {
     const model = process.env.GEMINI_TTS_MODEL || 'gemini-3.1-flash-tts-preview';
-    const voiceName = process.env.GEMINI_TTS_VOICE || 'Kore';
+    const voiceName = this.geminiTTSVoice;
 
     const response = await this.gemini.models.generateContent({
       model,
