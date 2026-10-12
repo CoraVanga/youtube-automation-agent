@@ -59,9 +59,11 @@ npm run walkthrough
 npm start
 ```
 
-Open `http://localhost:3456`. The walkthrough explains each provider choice, tests credentials, and guides YouTube authorization.
+Open `http://localhost:3456`. The walkthrough explains each provider choice, tests credentials, and guides YouTube authorization. The dashboard binds to loopback, so only this machine can reach it.
 
 Already know what you are doing? `npm run setup` offers a shorter classic flow, and `.env.example` documents every setting.
+
+[**Running the agent and using a local model**](docs/running-the-agent.md) covers starting and stopping it, what a stopped agent misses, and how to point text generation at a local Ollama server instead of a paid API.
 
 ### Verify production readiness
 
@@ -384,17 +386,18 @@ Daily analytics collection backfills each real publication's 24-hour and 7-day e
 ## API
 
 ```bash
-# health check
+# health check (unauthenticated; every API route below needs the key when API_KEY is set)
 curl http://localhost:3456/health
 
-# queue a video-generation job (send x-api-key if API_KEY is set in .env)
+# queue a video-generation job (every other route needs x-api-key when API_KEY is set)
 curl -X POST http://localhost:3456/generate \
   -H "Content-Type: application/json" \
   -H "x-api-key: $API_KEY" \
   -d '{"topic": "Top 10 Life Hacks", "style": "list"}'
 
 # inspect the returned background job
-curl http://localhost:3456/api/jobs/:jobId
+curl http://localhost:3456/api/jobs/:jobId \
+  -H "x-api-key: $API_KEY"
 
 # resume a failed/interrupted job from its first incomplete checkpoint
 curl -X POST http://localhost:3456/api/jobs/:jobId/resume \
@@ -409,7 +412,8 @@ curl -X POST http://localhost:3456/api/jobs/:jobId/resume \
   -d '{"stage":"thumbnail"}'
 
 # inspect the latest production-readiness evidence
-curl http://localhost:3456/api/readiness
+curl http://localhost:3456/api/readiness \
+  -H "x-api-key: $API_KEY"
 
 # run harmless live probes; add {"includePaidMedia":true} only to test paid image generation
 curl -X POST http://localhost:3456/api/readiness/run \

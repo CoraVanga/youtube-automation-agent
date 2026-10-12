@@ -280,6 +280,9 @@ class SetupWalkthrough {
       return;
     }
 
+    // A .env that predates this walkthrough may still be world-readable.
+    await fs.chmod(envPath, 0o600);
+
     if (/^\s*API_KEY\s*=\s*\S/m.test(contents)) {
       console.log(chalk.green('  ✓ Dashboard API key'));
       return;
