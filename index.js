@@ -272,10 +272,19 @@ class YouTubeAutomationAgent {
     const hasText = this.credentials.hasAITextProvider();
     const hasGemini = Boolean(creds.gemini?.apiKey || process.env.GEMINI_API_KEY);
     const hasImages = Boolean(creds.openai?.apiKey || process.env.OPENAI_API_KEY || hasGemini);
+    // Azure Speech is intentionally excluded: credentials for it are stored but
+    // no code path ever generates narration from them, so counting it here
+    // reported working narration for a setup that silently falls back to
+    // simulated audio, which cannot be published.
+    // ElevenLabs is only reachable with both a key and a voice ID; a key alone
+    // falls through to the next provider.
+    const hasElevenLabs = Boolean(
+      (creds.elevenLabs?.apiKey || process.env.ELEVENLABS_API_KEY) &&
+      (creds.elevenLabs?.voiceId || process.env.ELEVENLABS_VOICE_ID)
+    );
     const hasTTS = Boolean(
       creds.openai?.apiKey || process.env.OPENAI_API_KEY ||
-      creds.elevenLabs?.apiKey || process.env.ELEVENLABS_API_KEY ||
-      creds.azureSpeech?.subscriptionKey || process.env.AZURE_SPEECH_KEY ||
+      hasElevenLabs ||
       hasGemini
     );
     const hasFFmpeg = await checkFFmpeg();
@@ -1414,6 +1423,30 @@ class YouTubeAutomationAgent {
 
     // Lets the dashboard list what is installed locally instead of making the
     // operator type a model name by hand.
+    this.app.get('/api/providers/media', protect, async (_req, res) => {
+      try {
+        return res.json({ success: true, result: this.credentials.describeMediaProviders() });
+      } catch (error) {
+        return res.status(500).json({ success: false, error: error.message });
+      }
+    });
+
+    this.app.put('/api/providers/media', this.requireDashboardKey(), async (req, res) => {
+      try {
+        const result = await this.credentials.setMediaProvider(req.body || {});
+        // Narration and video run through agents built at startup, so a change
+        // needs those agents rebuilt before it is used.
+        result.restartRequired = true;
+        await this.db.executeQuery(
+          'INSERT INTO automation_events (event_type, status, data, created_at) VALUES (?, ?, ?, datetime("now"))',
+          ['media_provider_change', 'success', JSON.stringify({ kind: req.body?.kind, provider: req.body?.provider })]
+        );
+        return res.json({ success: true, result });
+      } catch (error) {
+        return res.status(error.status || 500).json({ success: false, error: error.message });
+      }
+    });
+
     this.app.get('/api/providers/ollama/models', protect, async (req, res) => {
       try {
         const models = await listOllamaModels(req.query.baseURL);

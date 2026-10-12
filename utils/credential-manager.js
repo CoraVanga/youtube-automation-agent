@@ -11,6 +11,74 @@ const {
   defaultOllamaBaseURL,
 } = require('./ai-text-service');
 
+// Narration and video credentials, described by where each one is stored and
+// which environment variable can supply it instead. Azure Speech is deliberately
+// absent: nothing reads it back (see utils/ai-video-generator.js), so offering it
+// would promise narration the pipeline cannot produce.
+const MEDIA_PROVIDERS = {
+  tts: [
+    {
+      id: 'elevenlabs',
+      name: 'ElevenLabs',
+      store: 'elevenLabs',
+      fields: [
+        { name: 'apiKey', label: 'API key', secret: true, env: 'ELEVENLABS_API_KEY' },
+        { name: 'voiceId', label: 'Voice ID', secret: false, env: 'ELEVENLABS_VOICE_ID' }
+      ]
+    },
+    {
+      id: 'openai',
+      name: 'OpenAI TTS',
+      store: 'openai',
+      sharedWith: 'OpenAI text and image generation',
+      fields: [{ name: 'apiKey', label: 'API key', secret: true, env: 'OPENAI_API_KEY' }]
+    },
+    {
+      id: 'gemini',
+      name: 'Gemini TTS',
+      store: 'gemini',
+      sharedWith: 'Gemini text and image generation',
+      fields: [{ name: 'apiKey', label: 'API key', secret: true, env: 'GEMINI_API_KEY' }]
+    }
+  ],
+  video: [
+    {
+      id: 'seedance',
+      name: 'ByteDance Seedance 2.5',
+      store: 'replicate',
+      fields: [{ name: 'apiKey', label: 'Replicate API token', secret: true, env: 'REPLICATE_API_TOKEN' }]
+    },
+    {
+      id: 'minimax_h3',
+      name: 'MiniMax H3',
+      store: 'minimax',
+      fields: [{ name: 'apiKey', label: 'MiniMax API key', secret: true, env: 'MINIMAX_API_KEY' }]
+    },
+    {
+      id: 'google_omni',
+      name: 'Google Gemini Omni Flash',
+      store: 'gemini',
+      sharedWith: 'Gemini text and TTS',
+      fields: [{ name: 'apiKey', label: 'Gemini API key', secret: true, env: 'GEMINI_API_KEY' }]
+    },
+    {
+      id: 'kling',
+      name: 'Kuaishou Kling 3.0 Omni',
+      store: 'kling',
+      fields: [
+        { name: 'accessKey', label: 'Access key', secret: true, env: 'KLING_ACCESS_KEY' },
+        { name: 'secretKey', label: 'Secret key', secret: true, env: 'KLING_SECRET_KEY' }
+      ]
+    },
+    {
+      id: 'wan',
+      name: 'Alibaba Wan 2.7',
+      store: 'wan',
+      fields: [{ name: 'apiKey', label: 'DashScope API key', secret: true, env: 'DASHSCOPE_API_KEY' }]
+    }
+  ]
+};
+
 // Enough to tell two keys apart in the dashboard without ever shipping one.
 function maskSecret(value) {
   const text = typeof value === 'string' ? value.trim() : '';
@@ -120,6 +188,81 @@ class CredentialManager {
       disableReasoning: Boolean(configured.disableReasoning),
       providers,
     };
+  }
+
+  // Narration and video credential status. Secret fields report only whether a
+  // value exists and its last four characters; a non-secret field such as a voice
+  // ID is returned in full because it is not a credential.
+  describeMediaProviders() {
+    const describeField = (store, field) => {
+      const stored = this.credentials[store]?.[field.name];
+      const fromEnv = field.env ? process.env[field.env] : null;
+      const value = stored || fromEnv || null;
+      return {
+        name: field.name,
+        label: field.label,
+        secret: field.secret,
+        env: field.env,
+        configured: Boolean(value),
+        fromEnvironment: Boolean(!stored && fromEnv),
+        hint: value ? (field.secret ? maskSecret(value) : value) : null
+      };
+    };
+
+    const describeKind = kind => MEDIA_PROVIDERS[kind].map(provider => {
+      const fields = provider.fields.map(field => describeField(provider.store, field));
+      return {
+        id: provider.id,
+        name: provider.name,
+        sharedWith: provider.sharedWith || null,
+        // Every field must be present before the provider can actually run.
+        ready: fields.every(field => field.configured),
+        fields
+      };
+    });
+
+    const tts = describeKind('tts');
+    return {
+      // Narration has no selector: the generator takes the first configured
+      // provider in this order, so the dashboard reports the same order.
+      ttsOrder: MEDIA_PROVIDERS.tts.map(provider => provider.id),
+      activeTTS: tts.find(provider => provider.ready)?.id || null,
+      tts,
+      video: describeKind('video')
+    };
+  }
+
+  async setMediaProvider(input = {}) {
+    const kind = String(input.kind || '').trim();
+    if (!MEDIA_PROVIDERS[kind]) {
+      throw Object.assign(new Error('Unsupported provider kind'), { status: 400 });
+    }
+
+    const provider = MEDIA_PROVIDERS[kind].find(entry => entry.id === input.provider);
+    if (!provider) {
+      throw Object.assign(new Error('Unsupported provider'), { status: 400 });
+    }
+
+    const values = input.values && typeof input.values === 'object' ? input.values : {};
+    // Merge rather than replace: several providers share a store with the text
+    // and image configuration, and an empty field means "keep what is stored".
+    const next = { ...(this.credentials[provider.store] || {}) };
+
+    for (const field of provider.fields) {
+      const supplied = typeof values[field.name] === 'string' ? values[field.name].trim() : '';
+      if (supplied) next[field.name] = supplied;
+    }
+
+    const missing = provider.fields
+      .filter(field => !next[field.name] && !(field.env && process.env[field.env]))
+      .map(field => field.label);
+    if (missing.length) {
+      throw Object.assign(new Error(`${provider.name} still needs: ${missing.join(', ')}`), { status: 400 });
+    }
+
+    this.credentials[provider.store] = next;
+    await this.saveCredentials();
+    return this.describeMediaProviders();
   }
 
   // Applies a provider change from the dashboard. Returns the validated shape so

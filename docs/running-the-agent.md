@@ -78,6 +78,40 @@ You need it for two things:
 
 Read the value out of `.env` when the browser prompts for it.
 
+## What is configured where
+
+| Credential | Dashboard | CLI |
+|---|---|---|
+| Channel name, goal, audience, voice, guardrails | ✅ Channel setup | ✅ |
+| AI text provider and model (including Ollama) | ✅ Channel setup | ✅ |
+| Narration keys (ElevenLabs, OpenAI, Gemini) | ✅ Channel setup | ✅ |
+| Video provider keys (Replicate, MiniMax, Kling, DashScope) | ✅ Channel setup | ✅ |
+| Which video provider to use | ✅ Channel setup | ✅ |
+| **YouTube account** | ❌ | `npm run walkthrough` |
+
+YouTube still runs through the CLI because connecting an account is an OAuth
+redirect and a loopback callback rather than a pasted key.
+
+Saving narration or video credentials in the dashboard requires a restart before the
+pipeline uses them: those agents build their clients once at startup.
+
+### Which narration provider runs
+
+Narration has no selector. The generator takes the first provider that is completely
+configured, in this order:
+
+1. **ElevenLabs** — needs both an API key *and* a voice ID. A key alone is skipped.
+2. **OpenAI TTS** — uses the same key as OpenAI text and images.
+3. **Gemini TTS** — uses the same key as Gemini text and images.
+
+If none of them is complete, narration is simulated, and a production with simulated
+narration **cannot be approved, scheduled, or published**. The dashboard states which
+provider will be used.
+
+Azure Speech is not offered. Credentials for it can still be stored by older setup
+flows, but no code path turns them into audio, so a setup relying on Azure alone
+produces simulated narration.
+
 ## Using a local model with Ollama
 
 Ollama replaces the **text** provider: scripts, strategy plans, SEO metadata, and comment

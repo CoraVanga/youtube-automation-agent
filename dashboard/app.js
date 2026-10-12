@@ -799,7 +799,10 @@ function switchView(view) {
   location.hash = view;
   // Provider state is fetched on demand rather than in the 8s dashboard poll,
   // which would otherwise reset the form while it is being edited.
-  if (view === 'settings') loadTextProvider();
+  if (view === 'settings') {
+    loadTextProvider();
+    loadMediaProviders();
+  }
 }
 
 function selectOptions(options, selected) {
@@ -1860,6 +1863,132 @@ $('#text-provider-select').addEventListener('change', async () => {
 $('#text-provider-refresh').addEventListener('click', () => {
   loadOllamaModels($('#text-provider-form').elements.baseURL.value);
 });
+
+// ── Narration and video provider credentials ─────────────────────────────────
+const mediaProviders = { state: null, loading: false };
+
+// Built as DOM nodes so a stored voice ID or provider name can never be read as
+// markup, and so secret inputs are never pre-filled with a stored value.
+function renderMediaPanel(kind, provider) {
+  const form = document.createElement('form');
+  form.className = 'panel settings-form';
+  form.dataset.kind = kind;
+  form.dataset.provider = provider.id;
+
+  const heading = document.createElement('h3');
+  heading.textContent = provider.name;
+  form.append(heading);
+
+  if (provider.sharedWith) {
+    const shared = document.createElement('small');
+    shared.textContent = `Shares its key with ${provider.sharedWith}.`;
+    form.append(shared);
+  }
+
+  const grid = document.createElement('div');
+  grid.className = 'form-grid';
+
+  for (const field of provider.fields) {
+    const label = document.createElement('label');
+    label.className = 'full-row';
+
+    const span = document.createElement('span');
+    span.textContent = field.label;
+
+    const input = document.createElement('input');
+    input.name = field.name;
+    input.autocomplete = 'off';
+    if (field.secret) {
+      input.type = 'password';
+      input.placeholder = field.configured ? 'Leave empty to keep the stored value' : '';
+    } else {
+      input.type = 'text';
+      // A voice ID is not a credential, so it round-trips and stays editable.
+      if (field.hint) input.value = field.hint;
+    }
+
+    const hint = document.createElement('small');
+    if (!field.configured) hint.textContent = 'Not set.';
+    else if (field.fromEnvironment) hint.textContent = `Set by ${field.env} in your environment.`;
+    else if (field.secret) hint.textContent = `Stored, ending ${field.hint}.`;
+    else hint.textContent = 'Stored.';
+
+    label.append(span, input, hint);
+    grid.append(label);
+  }
+
+  form.append(grid);
+
+  const actions = document.createElement('div');
+  actions.className = 'form-actions';
+  const save = document.createElement('button');
+  save.type = 'submit';
+  save.className = 'button primary';
+  save.textContent = provider.ready ? 'Update credentials' : 'Save credentials';
+  const status = document.createElement('small');
+  status.textContent = provider.ready ? 'Ready' : 'Incomplete';
+  actions.append(save, status);
+  form.append(actions);
+
+  return form;
+}
+
+function renderMediaProviders() {
+  const state = mediaProviders.state;
+  if (!state) return;
+
+  const ttsHost = $('#tts-panels');
+  const videoHost = $('#video-panels');
+  ttsHost.replaceChildren();
+  videoHost.replaceChildren();
+
+  const active = state.tts.find(provider => provider.id === state.activeTTS);
+  $('#tts-order-note').textContent = active
+    ? `${active.name} will be used. Narration falls back in this order: ${state.ttsOrder.join(' → ')}.`
+    : `No narration provider is complete, so productions cannot be approved. Order used: ${state.ttsOrder.join(' → ')}.`;
+
+  for (const provider of state.tts) ttsHost.append(renderMediaPanel('tts', provider));
+  for (const provider of state.video) videoHost.append(renderMediaPanel('video', provider));
+}
+
+async function loadMediaProviders() {
+  if (mediaProviders.loading) return;
+  mediaProviders.loading = true;
+  try {
+    const response = await api('/api/providers/media');
+    mediaProviders.state = response.result;
+    renderMediaProviders();
+  } catch (error) {
+    $('#tts-order-note').textContent = error.message;
+  } finally {
+    mediaProviders.loading = false;
+  }
+}
+
+// One delegated handler covers every generated panel.
+for (const host of ['#tts-panels', '#video-panels']) {
+  $(host).addEventListener('submit', async event => {
+    event.preventDefault();
+    const form = event.target;
+    const values = Object.fromEntries(new FormData(form));
+
+    $('#loading').classList.add('active');
+    try {
+      const response = await api('/api/providers/media', {
+        method: 'PUT',
+        body: JSON.stringify({ kind: form.dataset.kind, provider: form.dataset.provider, values })
+      });
+      mediaProviders.state = response.result;
+      showToast('Credentials saved. Restart the agent to use them.');
+      renderMediaProviders();
+    } catch (error) {
+      if (error.data?.code === 'API_KEY_REQUIRED') $('#text-provider-locked').classList.remove('hidden');
+      showToast(error.message, 'error');
+    } finally {
+      $('#loading').classList.remove('active');
+    }
+  });
+}
 
 $('#text-provider-form').addEventListener('submit', async event => {
   event.preventDefault();

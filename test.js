@@ -65,6 +65,7 @@ class SystemTest {
       { name: 'Reply Approval and Posting', test: () => this.testReplyApprovalAndPosting() },
       { name: 'Engagement AI Provider Wiring', test: () => this.testEngagementAIProviderWiring() },
       { name: 'Local Text Provider', test: () => this.testLocalTextProvider() },
+      { name: 'Media Provider Credentials', test: () => this.testMediaProviderCredentials() },
       { name: 'Engagement Sync Schedule', test: () => this.testEngagementSyncSchedule() },
       { name: 'Growth Experiment Refresh Schedule', test: () => this.testGrowthExperimentRefreshSchedule() }
     ];
@@ -3622,6 +3623,112 @@ class SystemTest {
     }
 
     this.logger.info('Local text provider test completed successfully');
+  }
+
+  async testMediaProviderCredentials() {
+    const envKeys = ['OPENAI_API_KEY', 'GEMINI_API_KEY', 'ELEVENLABS_API_KEY', 'ELEVENLABS_VOICE_ID',
+      'REPLICATE_API_TOKEN', 'MINIMAX_API_KEY', 'KLING_ACCESS_KEY', 'KLING_SECRET_KEY', 'DASHSCOPE_API_KEY'];
+    const savedEnv = {};
+    for (const key of envKeys) {
+      savedEnv[key] = process.env[key];
+      delete process.env[key];
+    }
+
+    const manager = new CredentialManager();
+    manager.credentials = {};
+    let saved = 0;
+    manager.saveCredentials = async () => { saved += 1; };
+
+    try {
+      const empty = manager.describeMediaProviders();
+      if (empty.activeTTS !== null) {
+        throw new Error('No narration provider should be active before anything is configured');
+      }
+      if (!empty.video.find(provider => provider.id === 'kling')) {
+        throw new Error('Video providers must include kling');
+      }
+      // Azure Speech has no narration code path; offering it would promise audio
+      // the pipeline cannot produce.
+      if (empty.tts.some(provider => /azure/i.test(provider.id))) {
+        throw new Error('Azure Speech must not be offered while no code path reads it');
+      }
+
+      // A provider with more than one required field stays incomplete until all
+      // of them are present.
+      let rejected = null;
+      try {
+        await manager.setMediaProvider({ kind: 'tts', provider: 'elevenlabs', values: { apiKey: 'el-secret-key-1234' } });
+      } catch (error) {
+        rejected = error.message;
+      }
+      if (!rejected || !/Voice ID/i.test(rejected)) {
+        throw new Error(`ElevenLabs must require a voice ID, got: ${rejected}`);
+      }
+
+      await manager.setMediaProvider({
+        kind: 'tts',
+        provider: 'elevenlabs',
+        values: { apiKey: 'el-secret-key-1234', voiceId: 'voice-abc' }
+      });
+      if (manager.credentials.elevenLabs?.apiKey !== 'el-secret-key-1234') {
+        throw new Error('ElevenLabs key was not stored');
+      }
+
+      // Sharing a store with the text provider must not wipe the sibling fields.
+      manager.credentials.gemini = { apiKey: 'gem-original-key', model: 'gemini-3.7-flash' };
+      await manager.setMediaProvider({ kind: 'video', provider: 'google_omni', values: { apiKey: 'gem-new-key-9876' } });
+      if (manager.credentials.gemini.model !== 'gemini-3.7-flash') {
+        throw new Error('Writing a shared store dropped the existing model');
+      }
+      if (manager.credentials.gemini.apiKey !== 'gem-new-key-9876') {
+        throw new Error('Shared store did not take the new key');
+      }
+
+      // An empty field keeps the stored value instead of clearing it.
+      await manager.setMediaProvider({ kind: 'video', provider: 'google_omni', values: { apiKey: '' } });
+      if (manager.credentials.gemini.apiKey !== 'gem-new-key-9876') {
+        throw new Error('An empty field must keep the stored credential');
+      }
+
+      const described = JSON.stringify(manager.describeMediaProviders());
+      for (const secret of ['el-secret-key-1234', 'gem-new-key-9876']) {
+        if (described.includes(secret)) {
+          throw new Error(`describeMediaProviders leaked ${secret}`);
+        }
+      }
+      // A voice ID is not a credential, so it round-trips for editing.
+      if (!described.includes('voice-abc')) {
+        throw new Error('A non-secret field must be returned in full');
+      }
+
+      const state = manager.describeMediaProviders();
+      if (state.activeTTS !== 'elevenlabs') {
+        throw new Error(`ElevenLabs should be the active narration provider, got ${state.activeTTS}`);
+      }
+
+      for (const bad of [{ kind: 'nope', provider: 'elevenlabs' }, { kind: 'tts', provider: 'nope' }]) {
+        let status = null;
+        try {
+          await manager.setMediaProvider({ ...bad, values: {} });
+        } catch (error) {
+          status = error.status;
+        }
+        if (status !== 400) {
+          throw new Error(`Unknown ${JSON.stringify(bad)} must be rejected with 400, got ${status}`);
+        }
+      }
+
+      if (saved === 0) {
+        throw new Error('setMediaProvider never persisted anything');
+      }
+    } finally {
+      for (const key of envKeys) {
+        if (savedEnv[key] === undefined) delete process.env[key];
+        else process.env[key] = savedEnv[key];
+      }
+    }
+
+    this.logger.info('Media provider credentials test completed successfully');
   }
 
   async testEngagementSyncSchedule() {
